@@ -1,0 +1,21 @@
+# Python
+*.egg-info
+*.pyc
+*.pyo
+
+# Twisted
+/_trial_temp
+/twistd.log
+/twistd.pid
+/twisted/plugins/dropin.cache
+
+# Buildout paths
+/*.egg-info
+/.installed.cfg
+/bin
+/build
+/develop-eggs
+/dist
+/downloads
+/eggs
+/parts
