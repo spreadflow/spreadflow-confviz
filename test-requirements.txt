@@ -1,1 +1,3 @@
+pyflakes
+pylint
 -e git+https://github.com/spreadflow/spreadflow-core#egg=SpreadFlowCore
