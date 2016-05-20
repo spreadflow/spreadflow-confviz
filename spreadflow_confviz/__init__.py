@@ -16,8 +16,6 @@ import os
 
 class ConfvizCommand(object):
 
-    compactjoin = False
-    compactstart = False
     path = None
     verbose = False
 
@@ -33,10 +31,6 @@ class ConfvizCommand(object):
         parser = argparse.ArgumentParser(prog=args[0])
         parser.add_argument('path', metavar='FILE',
                             help='Path to config file')
-        parser.add_argument('-s', '--compactstart', action='store_true',
-                            help='Only show startable items')
-        parser.add_argument('-j', '--compactjoin', action='store_true',
-                            help='Only show joinable items')
         parser.add_argument('-v', '--verbose', action='store_true',
                             help='Show all resources, not only documented ones')
 
@@ -64,11 +58,7 @@ class ConfvizCommand(object):
 
         g = graph.digraph(links + internal_dependencies)
 
-        if self.compactstart:
-            g = graph.contract(g, lambda n: len(get_events(n, scheduler.AttachEvent)))
-        elif self.compactjoin:
-            g = graph.reverse(graph.contract(g, lambda n: len(get_events(n, scheduler.DetachEvent))))
-        elif not self.verbose:
+        if not self.verbose:
             first_in_port_collection = set(c.ins[0] for c in port_collections)
             g = graph.contract(g, lambda n: n in first_in_port_collection)
 
