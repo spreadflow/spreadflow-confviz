@@ -42,16 +42,28 @@ class ConfvizCommand(object):
 
         parser.parse_args(args[1:], namespace=self)
 
-        flowmap = config_eval(self.path)
-        links = flowmap.compile()
-        g = graph.digraph(links)
-
         get_events = lambda n, *t: [entry for entry in flowmap.annotations[n].get('events', []) if entry[0] in t]
         is_controller = lambda n: len(get_events(n, scheduler.AttachEvent, scheduler.DetachEvent))
         is_component_collection = lambda c: isinstance(c, ComponentCollection)
         is_port_collection = lambda c: isinstance(c, PortCollection)
+
+        flowmap = config_eval(self.path)
+        links = flowmap.compile()
+
         component_collections = set(c for c in flowmap.annotations if is_component_collection(c))
         port_collections = set(c for c in flowmap.annotations if is_port_collection(c))
+
+        internal_dependencies = []
+        if not self.verbose:
+            for port_collection in port_collections - component_collections:
+                for port_in in port_collection.ins:
+                    for port_out in port_collection.outs:
+                        if port_in is not port_out:
+                            internal_dependencies.append((port_in, port_out))
+
+
+        g = graph.digraph(links + internal_dependencies)
+
         if self.compactstart:
             g = graph.contract(g, lambda n: len(get_events(n, scheduler.AttachEvent)))
         elif self.compactjoin:
