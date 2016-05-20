@@ -5,10 +5,10 @@ from __future__ import unicode_literals
 
 from spreadflow_core import graph, scheduler
 from spreadflow_core.config import config_eval
-from spreadflow_core.flow import PortCollection, ComponentCollection
+from spreadflow_core.flow import PortCollection
 from graphviz import Digraph
 from pprint import pformat
-from toposort import toposort_flatten
+from toposort import toposort
 
 import sys
 import argparse
@@ -17,7 +17,7 @@ import os
 class ConfvizCommand(object):
 
     path = None
-    verbose = False
+    level = 1
 
     def __init__(self, out=sys.stdout):
         self._out = out
@@ -31,64 +31,91 @@ class ConfvizCommand(object):
         parser = argparse.ArgumentParser(prog=args[0])
         parser.add_argument('path', metavar='FILE',
                             help='Path to config file')
-        parser.add_argument('-v', '--verbose', action='store_true',
-                            help='Show all resources, not only documented ones')
+        parser.add_argument('-l', '--level', type=int,
+                            help='Level of detail (0: toplevel components, default: 1)')
 
         parser.parse_args(args[1:], namespace=self)
 
-        get_events = lambda n, *t: [entry for entry in flowmap.annotations[n].get('events', []) if entry[0] in t]
-        is_controller = lambda n: len(get_events(n, scheduler.AttachEvent, scheduler.DetachEvent))
-        is_component_collection = lambda c: isinstance(c, ComponentCollection)
         is_port_collection = lambda c: isinstance(c, PortCollection)
 
         flowmap = config_eval(self.path)
         links = flowmap.compile()
+        outs, ins = zip(*links)
 
-        component_collections = set(c for c in flowmap.annotations if is_component_collection(c))
-        port_collections = set(c for c in flowmap.annotations if is_port_collection(c))
+        # Build up parent-child relationships.
+        comp_tree = []
+        for comp in set(list(ins) + list(outs) + list(flowmap.annotations.keys())):
+            if is_port_collection(comp):
+                for subcomp in set(comp.ins + comp.outs):
+                    if comp is not subcomp:
+                        comp_tree.append((comp, subcomp))
+            else:
+                comp_tree.append((comp, None))
 
-        internal_dependencies = []
-        if not self.verbose:
-            for port_collection in port_collections - component_collections:
-                for port_in in port_collection.ins:
-                    for port_out in port_collection.outs:
+        children = graph.digraph(comp_tree)
+        parents = graph.reverse(children)
+        levels = list(toposort(parents))
+
+        self.level = min(self.level, len(levels) - 1)
+
+        # Pretend that components at the specified level are fully connected.
+        extra_links = []
+        for comp in levels[self.level]:
+            if is_port_collection(comp):
+                for port_in in comp.ins:
+                    for port_out in comp.outs:
                         if port_in is not port_out:
-                            internal_dependencies.append((port_in, port_out))
+                            extra_links.append((port_in, port_out))
+
+        # Build up the flow graph.
+        g = graph.digraph(links + extra_links)
+        rg = graph.reverse(g)
+
+        # Only show ports at the specified level if they have a connection to
+        # ports with another parent.
+        ignorable_comps = set()
+        for comp in levels[self.level]:
+            if not is_port_collection(comp):
+                my_parents = parents.get(comp, [])
+                conns = g.get(comp, set()).union(rg.get(comp, set()))
+                for peer in conns:
+                    if my_parents != parents.get(peer):
+                        break
+                else:
+                    # Ignore this port if it has no peers or all of them a have the
+                    # same parent.
+                    ignorable_comps.add(comp)
+
+        # Ignore everything which is beyond the specified level.
+        for comps in levels[self.level+1:]:
+            ignorable_comps.update(comps)
 
 
-        g = graph.digraph(links + internal_dependencies)
-
-        if not self.verbose:
-            first_in_port_collection = set(c.ins[0] for c in port_collections)
-            g = graph.contract(g, lambda n: n in first_in_port_collection)
+        # Perform the graph contraction.
+        g = graph.contract(g, lambda n: n not in ignorable_comps)
 
         dg = Digraph(os.path.basename(self.path), engine='dot')
 
-        # Build clusters wrapping port collections and component collections.
+        # Build clusters wrapping port collections.
         subgraphs = {}
-        visible_ports = graph.vertices(g)
-        component_tree = {c: set(c.children) for c in component_collections}
-        for c in toposort_flatten(component_tree):
-            if is_component_collection(c) or (self.verbose and is_port_collection(c)):
-                sg = Digraph('cluster_{:s}'.format(str(hash(c))))
-                label = flowmap.annotations[c].get('label', self._strip_angle_brackets(str(c)))
-                tooltip = flowmap.annotations[c].get('description', repr(c) + "\n" + pformat(vars(c)))
-                sg.attr('graph', label=label, tooltip=tooltip, color="blue")
-
+        for level in reversed(levels[:self.level]):
+            for c in level:
                 if is_port_collection(c):
-                    for port in c.ins + c.outs:
-                        if port in visible_ports:
+                    sg = Digraph('cluster_{:s}'.format(str(hash(c))))
+                    label = flowmap.annotations[c].get('label', self._strip_angle_brackets(str(c)))
+                    tooltip = flowmap.annotations[c].get('description', repr(c) + "\n" + pformat(vars(c)))
+                    sg.attr('graph', label=label, tooltip=tooltip, color="blue")
+
+                    for port in set(c.ins + c.outs):
+                        if port not in ignorable_comps:
                             sg.node(str(hash(port)))
+                        if port in subgraphs:
+                            sg.subgraph(subgraphs.pop(port))
 
-                if is_component_collection(c):
-                    for child in c.children:
-                        if child in subgraphs:
-                            sg.subgraph(subgraphs.pop(child))
+                    subgraphs[c] = sg
 
-                subgraphs[c] = sg
-
-            for sg in subgraphs.values():
-                dg.subgraph(sg)
+        for sg in subgraphs.values():
+            dg.subgraph(sg)
 
         # Edges
         for src, sinks in g.items():
@@ -102,7 +129,7 @@ class ConfvizCommand(object):
             except TypeError:
                 tooltip = ''
             label = flowmap.annotations[n].get('label', self._strip_angle_brackets(str(n)))
-            dg.node(str(hash(n)), label=label, tooltip=tooltip, fontcolor='blue' if is_controller(n) else 'black')
+            dg.node(str(hash(n)), label=label, tooltip=tooltip)
 
         print(dg.pipe(format='svg'), file=self._out)
         return 0
