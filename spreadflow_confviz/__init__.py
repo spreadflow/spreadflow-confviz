@@ -3,29 +3,29 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-from spreadflow_core import graph, scheduler
+from spreadflow_core import graph
 from spreadflow_core.config import config_eval
 from spreadflow_core.component import PortCollection
-from spreadflow_core.dsl import \
-    AddTokenOp, \
+from spreadflow_core.dsl.parser import \
     AliasResolverPass, \
-    ComponentToken, \
     ComponentsPurgePass, \
-    ConnectionToken, \
-    DescriptionToken, \
-    EventHandlerToken, \
     EventHandlersPass, \
-    LabelToken, \
     PartitionBoundsPass, \
     PartitionControllersPass, \
     PartitionExpanderPass, \
-    PartitionSelectToken, \
     PartitionWorkerPass, \
     PortsValidatorPass, \
     portmap
-from spreadflow_core.dsl.compiler import \
-    token_attr_map, \
-    stream_extract
+from spreadflow_core.dsl.stream import \
+    AddTokenOp, \
+    stream_extract, \
+    token_attr_map
+from spreadflow_core.dsl.tokens import \
+    ComponentToken, \
+    ConnectionToken, \
+    DescriptionToken, \
+    LabelToken, \
+    PartitionSelectToken
 from graphviz import Digraph
 from pprint import pformat
 from toposort import toposort
