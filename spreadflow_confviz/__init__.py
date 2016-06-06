@@ -3,36 +3,85 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
+import argparse
+import itertools
+import os
+import sys
+
 from spreadflow_core import graph
 from spreadflow_core.config import config_eval
-from spreadflow_core.component import PortCollection
 from spreadflow_core.dsl.parser import \
     AliasResolverPass, \
     ComponentsPurgePass, \
-    EventHandlersPass, \
     PartitionBoundsPass, \
     PartitionControllersPass, \
     PartitionExpanderPass, \
     PartitionWorkerPass, \
     PortsValidatorPass, \
+    parentmap, \
     portmap
 from spreadflow_core.dsl.stream import \
     AddTokenOp, \
     stream_extract, \
-    token_attr_map
+    stream_divert, \
+    token_attr_map, \
+    token_map
 from spreadflow_core.dsl.tokens import \
-    ComponentToken, \
     ConnectionToken, \
     DescriptionToken, \
     LabelToken, \
+    ParentElementToken, \
     PartitionSelectToken
 from graphviz import Digraph
 from pprint import pformat
-from toposort import toposort
+from toposort import toposort_flatten
 
-import sys
-import argparse
-import os
+class DepthReductionPass(object):
+
+    def __init__(self, maxdepth):
+        self.maxdepth = maxdepth
+
+    def __call__(self, stream):
+        connection_ops, stream = stream_divert(stream, ConnectionToken)
+        parent_ops, stream = stream_divert(stream, ParentElementToken)
+        for op in stream: yield op
+
+        parent_map = parentmap(parent_ops)
+
+        forest = graph.digraph(parent_map.items())
+        node_depth = {}
+        node_repl = {}
+        for node in toposort_flatten(forest, sort=False):
+            parent = None
+
+            try:
+                parent = parent_map[node]
+            except KeyError:
+                depth = 0
+            else:
+                depth = node_depth[parent] + 1
+
+            node_depth[node] = depth
+
+            if depth == self.maxdepth:
+                node_repl[node] = node
+            elif depth > self.maxdepth:
+                node_repl[node] = node_repl[parent]
+
+        for node, depth in node_depth.items():
+            if depth > 0 and depth <= self.maxdepth:
+                yield AddTokenOp(ParentElementToken(node, parent_map[node]))
+
+        seen = set()
+        for port_out, port_in in portmap(connection_ops).items():
+            repl_port_out = node_repl.get(port_out, port_out)
+            repl_port_in = node_repl.get(port_in, port_in)
+            if repl_port_out is not repl_port_in:
+                token = ConnectionToken(repl_port_out, repl_port_in)
+                if not token in seen:
+                    seen.add(token)
+                    yield AddTokenOp(token)
+
 
 class ConfvizCommand(object):
 
@@ -62,8 +111,6 @@ class ConfvizCommand(object):
 
         parser.parse_args(args[1:], namespace=self)
 
-        is_port_collection = lambda c: isinstance(c, PortCollection)
-
         stream = config_eval(self.path)
 
         pipeline = list()
@@ -81,16 +128,16 @@ class ConfvizCommand(object):
                 pipeline.append(PartitionControllersPass())
 
         pipeline.append(ComponentsPurgePass())
-        pipeline.append(EventHandlersPass())
+        pipeline.append(DepthReductionPass(self.level))
 
         for compiler_step in pipeline:
             stream = compiler_step(stream)
 
         connection_ops, stream = stream_extract(stream, ConnectionToken)
-        connections = list(portmap(connection_ops).items())
+        connections = token_map(connection_ops).values()
 
-        component_ops, stream = stream_extract(stream, ComponentToken)
-        components = list(token_attr_map(component_ops, 'element'))
+        parent_ops, stream = stream_extract(stream, ParentElementToken)
+        parent_map = parentmap(parent_ops)
 
         label_ops, stream = stream_extract(stream, LabelToken)
         labels = token_attr_map(label_ops, 'element', 'label')
@@ -98,97 +145,44 @@ class ConfvizCommand(object):
         description_ops, stream = stream_extract(stream, DescriptionToken)
         descriptions = token_attr_map(description_ops, 'element', 'description')
 
-        outs, ins = zip(*connections)
-
-        # Build up parent-child relationships.
-        comp_tree = []
-        for comp in set(list(ins) + list(outs) + list(components)):
-            if is_port_collection(comp):
-                for subcomp in set(comp.ins + comp.outs):
-                    if comp is not subcomp:
-                        comp_tree.append((comp, subcomp))
-            else:
-                comp_tree.append((comp, None))
-
-        children = graph.digraph(comp_tree)
-        parents = graph.reverse(children)
-        levels = list(toposort(parents))
-
-        self.level = min(self.level, len(levels))
-
-        # Pretend that components at the specified level are fully connected.
-        extra_links = []
-        if self.level < len(levels):
-            for comp in levels[self.level]:
-                if is_port_collection(comp):
-                    for port_in in comp.ins:
-                        for port_out in comp.outs:
-                            if port_in is not port_out:
-                                extra_links.append((port_in, port_out))
-
-        # Build up the flow graph.
-        g = graph.digraph(connections + extra_links)
-        rg = graph.reverse(g)
-
-        # Only show ports at the specified level if they have a connection to
-        # ports with another parent.
-        ignorable_comps = set()
-        if self.level < len(levels):
-            for comp in levels[self.level]:
-                if not is_port_collection(comp):
-                    my_parents = parents.get(comp, [])
-                    conns = g.get(comp, set()).union(rg.get(comp, set()))
-                    for peer in conns:
-                        if my_parents != parents.get(peer):
-                            break
-                    else:
-                        # Ignore this port if it has no peers or all of them a have the
-                        # same parent.
-                        ignorable_comps.add(comp)
-
-        # Ignore everything which is beyond the specified level.
-        for comps in levels[self.level+1:]:
-            ignorable_comps.update(comps)
-
-
-        # Perform the graph contraction.
-        g = graph.contract(g, lambda n: n not in ignorable_comps)
+        ports = set(itertools.chain(*zip(*connections)))
 
         dg = Digraph(os.path.basename(self.path), engine='dot')
 
-        # Build clusters wrapping port collections.
+        # Walk the component trees from leaves to roots and build clusters.
         subgraphs = {}
-        visible_ports = set(ins + outs)
-        for level in reversed(levels[:self.level]):
-            for c in level:
-                if is_port_collection(c):
-                    ports = set(c.ins + c.outs).intersection(visible_ports)
-                    if len(ports) == 0:
-                        continue
-
-                    sg = Digraph('cluster_{:s}'.format(str(hash(c))))
-                    label = labels.get(c, self._strip_angle_brackets(str(c)))
-                    tooltip = descriptions.get(c, repr(c) + "\n" + pformat(vars(c)))
+        forest = graph.digraph(parent_map.items())
+        for child in toposort_flatten(graph.reverse(forest), sort=False):
+            if child in parent_map:
+                parent = parent_map[child]
+                try:
+                    sg = subgraphs[parent]
+                except KeyError:
+                    sg = Digraph('cluster_{:s}'.format(str(hash(parent))))
+                    label = labels.get(parent, self._strip_angle_brackets(str(parent)))
+                    tooltip = descriptions.get(parent, repr(parent) + "\n" + pformat(vars(parent)))
                     sg.attr('graph', label=label, tooltip=tooltip, color="blue")
+                    subgraphs[parent] = sg
 
-                    for port in ports:
-                        if port not in ignorable_comps:
-                            sg.node(str(hash(port)))
-                        if port in subgraphs:
-                            sg.subgraph(subgraphs.pop(port))
-
-                    subgraphs[c] = sg
+                if child in subgraphs:
+                    child_sg = subgraphs.pop(child)
+                    if child in ports:
+                        # Place the port inside its own subgraph if a port is
+                        # also the parent of other ports.
+                        child_sg.node(str(hash(child)))
+                    sg.subgraph(child_sg)
+                elif child in ports:
+                    sg.node(str(hash(child)))
 
         for sg in subgraphs.values():
             dg.subgraph(sg)
 
         # Edges
-        for src, sinks in g.items():
-            for sink in sinks:
-                dg.edge(str(hash(src)), str(hash(sink)))
+        for src, sink in connections:
+            dg.edge(str(hash(src)), str(hash(sink)))
 
         # Tooltips
-        for n in graph.vertices(g):
+        for n in ports:
             try:
                 tooltip = descriptions.get(n, repr(n) + "\n" + pformat(vars(n)))
             except TypeError:
