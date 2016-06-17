@@ -18,7 +18,6 @@ setup(
     install_requires=[
         'SpreadFlowCore',
         'graphviz',
-        'toposort',
     ],
     zip_safe=True,
     classifiers=[

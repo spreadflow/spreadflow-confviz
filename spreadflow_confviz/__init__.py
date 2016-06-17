@@ -4,63 +4,49 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 import argparse
-import itertools
 import os
 import sys
 
-from spreadflow_core import graph
 from spreadflow_core.config import config_eval
 from spreadflow_core.dsl.parser import \
     AliasResolverPass, \
     ComponentsPurgePass, \
+    ConnectionParser, \
+    DescriptionParser, \
+    LabelParser, \
+    ParentParser, \
     PartitionBoundsPass, \
     PartitionControllersPass, \
     PartitionExpanderPass, \
     PartitionWorkerPass, \
-    PortsValidatorPass, \
-    parentmap, \
-    portmap
+    PortsValidatorPass
 from spreadflow_core.dsl.stream import \
     AddTokenOp, \
-    stream_extract, \
-    stream_divert, \
-    token_attr_map, \
     token_map
 from spreadflow_core.dsl.tokens import \
     ConnectionToken, \
-    DescriptionToken, \
-    LabelToken, \
     ParentElementToken, \
     PartitionSelectToken
 from graphviz import Digraph
 from pprint import pformat
-from toposort import toposort_flatten
 
 class DepthReductionPass(object):
+
+    connection_parser = ConnectionParser()
+    parent_parser = ParentParser()
 
     def __init__(self, maxdepth):
         self.maxdepth = maxdepth
 
     def __call__(self, stream):
-        connection_ops, stream = stream_divert(stream, ConnectionToken)
-        parent_ops, stream = stream_divert(stream, ParentElementToken)
+        stream = self.connection_parser.divert(stream)
+        stream = self.parent_parser.divert(stream)
         for op in stream: yield op
 
-        parent_map = parentmap(parent_ops)
-
-        forest = graph.digraph(parent_map.items())
         node_depth = {}
         node_repl = {}
-        for node in toposort_flatten(forest, sort=False):
-            parent = None
-
-            try:
-                parent = parent_map[node]
-            except KeyError:
-                depth = 0
-            else:
-                depth = node_depth[parent] + 1
-
+        for node, parent in self.parent_parser.get_parentmap_toposort():
+            depth = 0 if parent is None else node_depth[parent] + 1
             node_depth[node] = depth
 
             if depth == self.maxdepth:
@@ -68,12 +54,11 @@ class DepthReductionPass(object):
             elif depth > self.maxdepth:
                 node_repl[node] = node_repl[parent]
 
-        for node, depth in node_depth.items():
             if depth > 0 and depth <= self.maxdepth:
-                yield AddTokenOp(ParentElementToken(node, parent_map[node]))
+                yield AddTokenOp(ParentElementToken(node, parent))
 
         seen = set()
-        for port_out, port_in in portmap(connection_ops).items():
+        for port_out, port_in in self.connection_parser.get_links():
             repl_port_out = node_repl.get(port_out, port_out)
             repl_port_in = node_repl.get(port_in, port_in)
             if repl_port_out is not repl_port_in:
@@ -82,6 +67,19 @@ class DepthReductionPass(object):
                     seen.add(token)
                     yield AddTokenOp(token)
 
+class DepthReducedConnectionParser(ConnectionParser):
+    """
+    Extracts information about connected ports from a stream of operations.
+
+    This is similar to ConnectionParser but it also allows connecting more than
+    one input port to an output port.
+    """
+
+    def get_links(self):
+        """
+        Returns an iterator over output, input pairs
+        """
+        return token_map(self.selected).values()
 
 class ConfvizCommand(object):
 
@@ -89,6 +87,12 @@ class ConfvizCommand(object):
     level = 1
     multiprocess = False
     partition = None
+
+    connection_parser = DepthReducedConnectionParser()
+    description_parser = DescriptionParser()
+    label_parser = LabelParser()
+    links_parser = DepthReducedConnectionParser()
+    parent_parser = ParentParser()
 
     def __init__(self, out=sys.stdout):
         self._out = out
@@ -133,28 +137,22 @@ class ConfvizCommand(object):
         for compiler_step in pipeline:
             stream = compiler_step(stream)
 
-        connection_ops, stream = stream_extract(stream, ConnectionToken)
-        connections = token_map(connection_ops).values()
+        stream = self.connection_parser.extract(stream)
+        stream = self.description_parser.extract(stream)
+        stream = self.label_parser.extract(stream)
+        stream = self.links_parser.extract(stream)
+        stream = self.parent_parser.extract(stream)
 
-        parent_ops, stream = stream_extract(stream, ParentElementToken)
-        parent_map = parentmap(parent_ops)
-
-        label_ops, stream = stream_extract(stream, LabelToken)
-        labels = token_attr_map(label_ops, 'element', 'label')
-
-        description_ops, stream = stream_extract(stream, DescriptionToken)
-        descriptions = token_attr_map(description_ops, 'element', 'description')
-
-        ports = set(itertools.chain(*zip(*connections)))
+        labels = self.label_parser.get_labelmap()
+        descriptions = self.description_parser.get_descriptionmap()
+        ports = self.connection_parser.get_portset()
 
         dg = Digraph(os.path.basename(self.path), engine='dot')
 
         # Walk the component trees from leaves to roots and build clusters.
         subgraphs = {}
-        forest = graph.digraph(parent_map.items())
-        for child in toposort_flatten(graph.reverse(forest), sort=False):
-            if child in parent_map:
-                parent = parent_map[child]
+        for child, parent in self.parent_parser.get_parentmap_toposort(reverse=True):
+            if parent is not None:
                 try:
                     sg = subgraphs[parent]
                 except KeyError:
@@ -178,7 +176,7 @@ class ConfvizCommand(object):
             dg.subgraph(sg)
 
         # Edges
-        for src, sink in connections:
+        for src, sink in self.links_parser.get_links():
             dg.edge(str(hash(src)), str(hash(sink)))
 
         # Tooltips
